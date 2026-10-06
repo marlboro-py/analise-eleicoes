@@ -1,0 +1,167 @@
+```{r}
+/* cSpell:disable */
+
+library(tidyverse)
+library(duckdb)
+library(here)
+library(DBI)
+library(sf)
+
+con <- DBI::dbConnect(duckdb::duckdb(), here("repos/eleicoes/dfs/eleicoes_rj_uf.duckdb"), read_only = TRUE)
+
+## BLOCO 1
+## Mudança de voto pro Paes - bairro a bairro (pêndulos, derrotas, crescimento), se der tempo, incluir dado socio economico
+votos_bairro <- DBI::dbGetQuery(
+    con,
+    "
+    WITH b AS (
+        SELECT  ano,
+                id_municipio_tse,
+                id_municipio,
+                zona,
+                secao,
+                turno,
+                STRIP_ACCENTS(UPPER(TRIM(bairro))) bairro,
+                eleitores_secao
+        FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
+    ), e AS (
+        SELECT  ano,
+                turno,
+                id_municipio_tse,
+                bairro,
+                SUM(eleitores_secao) eleitores
+        FROM b
+        GROUP BY 1, 2, 3, 4
+    ), 
+    v AS (
+        SELECT  r.ano,
+                r.turno,
+                r.numero_candidato,
+                b.bairro,
+                b.id_municipio,
+                b.id_municipio_tse,
+                SUM(r.votos) votos
+        FROM br_tse_eleicoes.resultados_candidato_secao r
+        LEFT JOIN b
+            ON r.ano = b.ano
+            AND r.id_municipio_tse = b.id_municipio_tse
+            AND r.zona = b.zona
+            AND r.secao = b.secao
+            AND r.turno = b.turno
+        WHERE (r.ano = 2018 AND r.turno = 2 AND cargo = 'governador') OR (r.ano = 2026 AND r.turno = 1 AND cargo = 'governador')
+        GROUP BY 1, 2, 3, 4, 5, 6
+    )
+
+    SELECT  v.*,
+            e.eleitores
+    FROM v
+    LEFT JOIN e 
+        ON v.ano = e.ano 
+        AND v.turno = e.turno 
+        AND v.id_municipio_tse = e.id_municipio_tse 
+        AND v.bairro = e.bairro
+    "
+)
+
+paes_bairro <- votos_bairro %>%
+    # Paes foi 25 em 2018 e 55 em 2026 (em 2018 o 55 era o Indio da Costa)
+    mutate(paes = (ano == 2018 & numero_candidato == "25") | (ano == 2026 & numero_candidato == "55")) %>%
+    group_by(ano, turno, id_municipio, bairro, numero_candidato, paes) %>%
+    summarise(votos = sum(votos, na.rm = TRUE), .groups = "drop") %>%
+    group_by(ano, turno, id_municipio, bairro) %>%
+    summarise(
+        votos_paes = sum(votos[paes]),
+        votos_total = sum(votos),
+        margem = (votos_paes - max(c(0, votos[!paes]))) / votos_total,  # > 0: Paes venceu no bairro
+        .groups = "drop"
+    ) %>%
+    mutate(pct_paes = votos_paes / votos_total) %>%
+    pivot_wider(
+        id_cols = c(id_municipio, bairro),
+        names_from = c(ano, turno),
+        values_from = c(pct_paes, margem, votos_total),
+        names_glue = "{.value}_{ano}_t{turno}"
+    ) %>%
+    mutate(
+        delta = pct_paes_2026_t1 - pct_paes_2018_t2,
+        perfil = case_when(
+            margem_2018_t2 > 0 & margem_2026_t1 > 0 ~ "reduto",
+            margem_2018_t2 <= 0 & margem_2026_t1 <= 0 ~ "derrota nas duas",
+            margem_2018_t2 <= 0 & margem_2026_t1 > 0 ~ "virou pro Paes",
+            margem_2018_t2 > 0 & margem_2026_t1 <= 0 ~ "virou contra"
+        )
+    )
+
+paes_bairro %>%
+    group_by(perfil) %>%
+    summarise(
+        bairros = n(),
+        total_votos_2018_t2 = sum(votos_total_2018_t2, na.rm = TRUE),
+        total_votos_2026_t1 = sum(votos_total_2026_t1, na.rm = TRUE)
+    )
+
+# desenho dos bairros a partir dos locais de votacao de 2024: cada local fica com a area mais proxima dele
+# (Voronoi), recortada pelo municipio, e as areas sao unidas pelo texto de bairro do TSE
+municipios <- DBI::dbGetQuery(con, "SELECT id_municipio, geometria FROM br_geobr_mapas.municipio") %>%
+    st_as_sf(wkt = "geometria", crs = 4326) %>%
+    st_make_valid() %>%
+    st_transform(31983)   # metros (SIRGAS 2000 / UTM 23S), o Voronoi precisa de distancia plana
+
+locais <- DBI::dbGetQuery(
+    con,
+    "
+    SELECT  id_municipio,
+            zona,
+            numero,
+            ANY_VALUE(STRIP_ACCENTS(UPPER(TRIM(bairro)))) bairro,
+            ANY_VALUE(latitude) latitude,
+            ANY_VALUE(longitude) longitude,
+            SUM(eleitores_secao) eleitores
+    FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
+    WHERE ano = 2024
+    AND turno = 1
+    AND latitude IS NOT NULL
+    GROUP BY 1, 2, 3
+    "
+) %>%
+    arrange(desc(eleitores)) %>%
+    distinct(id_municipio, latitude, longitude, .keep_all = TRUE) %>%   # locais no mesmo ponto: fica o bairro com mais eleitores
+    st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+    st_transform(31983)
+
+desenhar_bairros <- function(pontos, contorno) {
+    if (nrow(pontos) == 1) {
+        return(st_sf(bairro = pontos$bairro, geometria = st_geometry(contorno)))
+    }
+    st_union(pontos) %>%
+        st_voronoi(envelope = st_geometry(contorno)) %>%
+        st_collection_extract("POLYGON") %>%
+        st_sf(geometria = .) %>%
+        st_join(pontos %>% select(bairro), join = st_contains) %>%
+        st_intersection(st_geometry(contorno)) %>%
+        group_by(bairro) %>%
+        summarise(.groups = "drop")
+}
+
+bairros_voronoi <- municipios %>%
+    filter(id_municipio %in% locais$id_municipio) %>%
+    group_split(id_municipio) %>%
+    map(\(contorno) desenhar_bairros(filter(locais, id_municipio == contorno$id_municipio), contorno) %>%
+            mutate(id_municipio = contorno$id_municipio)) %>%
+    bind_rows() %>%
+    st_transform(4326)
+
+mapa_paes <- bairros_voronoi %>%
+        left_join(paes_bairro, by = c("id_municipio", "bairro"))
+
+```
+
+```{r}
+DBI::dbGetQuery(
+    con,
+    "
+     SELECT * FROM br_tse_eleicoes.resultados_candidato_secao LIMIT 10
+    "
+)
+
+```

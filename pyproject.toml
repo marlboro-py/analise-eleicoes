@@ -1,0 +1,18 @@
+[project]
+name = "eleicoes-rj"
+version = "0.1.0"
+description = "Coleta de dados eleitorais do RJ para um banco DuckDB"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb==1.5.6",                          # banco relacional local
+    "pyarrow==25.0.1",                        # Parquet e troca de dados com o BigQuery
+    "google-cloud-bigquery==3.46.1",          # consultas a Base dos Dados e ao datario
+    "google-cloud-bigquery-storage==2.42.0",  # download rapido de resultados grandes
+    "ipykernel==7.4.0",                       # motor Python do Quarto
+    "nbclient==0.11.0",                       # execucao do caderno pelo Quarto
+    "nbformat==5.11.1",                       # idem
+    "pyyaml==6.0.3",                          # idem
+]
+
+[tool.uv]
+package = false

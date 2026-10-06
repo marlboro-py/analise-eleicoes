@@ -1,0 +1,6 @@
+/.quarto/
+/_site/
+/dfs/
+/.venv/
+__pycache__
+.vdoc.*
