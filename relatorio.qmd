@@ -1,5 +1,5 @@
 ```{r}
-/* cSpell:disable */
+# cSpell:disable
 
 library(tidyverse)
 library(duckdb)
@@ -24,7 +24,8 @@ votos_bairro <- DBI::dbGetQuery(
                 STRIP_ACCENTS(UPPER(TRIM(bairro))) bairro,
                 eleitores_secao
         FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
-    ), e AS (
+    ), 
+    e AS (
         SELECT  ano,
                 turno,
                 id_municipio_tse,
@@ -50,55 +51,195 @@ votos_bairro <- DBI::dbGetQuery(
             AND r.turno = b.turno
         WHERE (r.ano = 2018 AND r.turno = 2 AND cargo = 'governador') OR (r.ano = 2026 AND r.turno = 1 AND cargo = 'governador')
         GROUP BY 1, 2, 3, 4, 5, 6
+    ),
+    c AS (
+        SELECT  d.ano,
+                d.turno,
+                b.id_municipio_tse,
+                b.bairro,
+                SUM(d.aptos) aptos,
+                SUM(d.comparecimento) comparecimento,
+                SUM(d.abstencoes) abstencoes,
+                SUM(d.votos_brancos) brancos,
+                SUM(d.votos_nulos) nulos
+        FROM br_tse_eleicoes.detalhes_votacao_secao d
+        LEFT JOIN b
+            ON d.ano = b.ano
+            AND d.id_municipio_tse = b.id_municipio_tse
+            AND d.zona = b.zona
+            AND d.secao = b.secao
+            AND d.turno = b.turno
+        WHERE (d.ano = 2018 AND d.turno = 2 AND d.cargo = 'governador') OR (d.ano = 2026 AND d.turno = 1 AND d.cargo = 'governador')
+        GROUP BY 1, 2, 3, 4
     )
 
     SELECT  v.*,
-            e.eleitores
+            e.eleitores,
+            c.aptos,
+            c.comparecimento,
+            c.abstencoes,
+            c.brancos,
+            c.nulos
     FROM v
     LEFT JOIN e 
         ON v.ano = e.ano 
         AND v.turno = e.turno 
         AND v.id_municipio_tse = e.id_municipio_tse 
         AND v.bairro = e.bairro
+    LEFT JOIN c
+        ON v.ano = c.ano
+        AND v.turno = c.turno
+        AND v.id_municipio_tse = c.id_municipio_tse
+        AND v.bairro = c.bairro
     "
 )
 
-paes_bairro <- votos_bairro %>%
-    # Paes foi 25 em 2018 e 55 em 2026 (em 2018 o 55 era o Indio da Costa)
-    mutate(paes = (ano == 2018 & numero_candidato == "25") | (ano == 2026 & numero_candidato == "55")) %>%
-    group_by(ano, turno, id_municipio, bairro, numero_candidato, paes) %>%
-    summarise(votos = sum(votos, na.rm = TRUE), .groups = "drop") %>%
-    group_by(ano, turno, id_municipio, bairro) %>%
-    summarise(
-        votos_paes = sum(votos[paes]),
-        votos_total = sum(votos),
-        margem = (votos_paes - max(c(0, votos[!paes]))) / votos_total,  # > 0: Paes venceu no bairro
-        .groups = "drop"
-    ) %>%
-    mutate(pct_paes = votos_paes / votos_total) %>%
-    pivot_wider(
-        id_cols = c(id_municipio, bairro),
-        names_from = c(ano, turno),
-        values_from = c(pct_paes, margem, votos_total),
-        names_glue = "{.value}_{ano}_t{turno}"
-    ) %>%
-    mutate(
-        delta = pct_paes_2026_t1 - pct_paes_2018_t2,
-        perfil = case_when(
-            margem_2018_t2 > 0 & margem_2026_t1 > 0 ~ "reduto",
-            margem_2018_t2 <= 0 & margem_2026_t1 <= 0 ~ "derrota nas duas",
-            margem_2018_t2 <= 0 & margem_2026_t1 > 0 ~ "virou pro Paes",
-            margem_2018_t2 > 0 & margem_2026_t1 <= 0 ~ "virou contra"
-        )
+perfil_bairro <- DBI::dbGetQuery(
+    con,
+    "
+    WITH b AS (
+        SELECT  ano,
+                id_municipio_tse,
+                id_municipio,
+                zona,
+                secao,
+                turno,
+                STRIP_ACCENTS(UPPER(TRIM(bairro))) bairro
+        FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
+    ),
+    p AS (
+        SELECT  *,
+                TRY_CAST(LEFT(grupo_idade, 2) AS INT) idade_min   -- 1600 = 16 anos, 2124 = 21 a 24, 9999 = 100 ou mais
+        FROM br_tse_eleicoes.perfil_eleitorado_secao
+        WHERE ano IN (2018, 2026)
     )
 
-paes_bairro %>%
-    group_by(perfil) %>%
-    summarise(
-        bairros = n(),
-        total_votos_2018_t2 = sum(votos_total_2018_t2, na.rm = TRUE),
-        total_votos_2026_t1 = sum(votos_total_2026_t1, na.rm = TRUE)
-    )
+    -- o perfil do eleitorado e um por ano (nao tem turno): liga a secao ao bairro pelo 1o turno
+    SELECT  p.ano,
+            b.id_municipio,
+            b.bairro,
+            SUM(p.eleitores) eleitores_perfil,
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.genero = '4'), 0) / SUM(p.eleitores) pct_mulheres,      -- 2 masculino, 4 feminino, 0 nao informado
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 16 AND 24), 0) / SUM(p.eleitores) pct_16_24,
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 25 AND 34), 0) / SUM(p.eleitores) pct_25_34,
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 35 AND 44), 0) / SUM(p.eleitores) pct_35_44,
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 45 AND 59), 0) / SUM(p.eleitores) pct_45_59,
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min >= 60), 0) / SUM(p.eleitores) pct_60_mais,
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.instrucao IN ('7', '8')), 0) / SUM(p.eleitores) pct_superior,              -- 7 superior incompleto, 8 completo
+            COALESCE(SUM(p.eleitores) FILTER (WHERE p.instrucao IN ('1', '2', '3')), 0) / SUM(p.eleitores) pct_ate_fund_incompleto -- analfabeto, le e escreve, fundamental incompleto
+    FROM p
+    JOIN b
+        ON p.ano = b.ano
+        AND p.id_municipio_tse = b.id_municipio_tse
+        AND p.zona = b.zona
+        AND p.secao = b.secao
+        AND b.turno = 1
+    GROUP BY 1, 2, 3
+    "
+)
+
+votos_bairro <- votos_bairro %>%
+                    mutate(
+                        paes = (ano == 2018 & numero_candidato == "25") | (ano == 2026 & numero_candidato == "55"),
+                        oposicao = (ano == 2018 & numero_candidato == "20")  | (ano == 2026 & numero_candidato == "22"),
+                        transferivel = !paes & !oposicao
+                    ) %>%
+                    group_by(ano, id_municipio, bairro) %>%
+                    summarise(
+                        votos_paes = sum(votos[paes]),
+                        votos_oposicao = sum(votos[oposicao]),
+                        votos_transferiveis = sum(votos[transferivel]),
+                        votos_total = sum(votos),
+                        across(eleitores:nulos, ~ max(.x, na.rm = TRUE), .names = "votos_{.col}_total"),
+                        .groups = "drop"
+                    ) 
+
+nomes_municipio <- DBI::dbGetQuery(
+    con,
+    "
+    SELECT  id_municipio,
+            nome nome_municipio
+    FROM br_bd_diretorios_brasil.municipio
+    WHERE sigla_uf = 'RJ'
+    "
+)
+
+votos_margem <- bind_rows(
+        votos_bairro %>% 
+            mutate(nivel = "bairro"),
+        votos_bairro %>%
+            group_by(ano, id_municipio) %>%
+            summarise(across(starts_with("votos"), ~ sum(.x, na.rm = TRUE)), .groups = "drop") %>%
+            mutate(nivel = "municipio")
+    ) %>%
+    mutate(
+        pct_paes = votos_paes / votos_total,
+        margem_bruta = votos_paes - votos_oposicao,       # > 0: Paes venceu
+        margem = margem_bruta / votos_total,
+        reserva = votos_abstencoes_total + votos_brancos_total + votos_nulos_total,           # eleitores que nao escolheram ninguem
+        reserva_c_transferiveis = reserva + votos_transferiveis,
+        pct_abstencao = votos_abstencoes_total / votos_aptos_total,
+        pct_comparecimento = votos_comparecimento_total / votos_aptos_total   # mesmo denominador da proporcao_comparecimento do TSE
+    ) %>%
+    # compara 2026 com 2018 na mesma area sem pivot: lag pega a linha de 2018
+    arrange(ano) %>%
+    group_by(nivel, id_municipio, bairro) %>%
+    mutate(
+        across(c(votos_paes, pct_paes, margem_bruta, margem, pct_abstencao), ~ .x - lag(.x), .names = "delta_{.col}"),
+        venceu_2018 = lag(margem_bruta > 0)
+    ) %>%
+    ungroup() %>%
+    mutate(
+        perfil = case_when(
+            venceu_2018 & margem_bruta > 0 ~ "reduto",
+            !venceu_2018 & margem_bruta <= 0 ~ "derrota nas duas",
+            !venceu_2018 & margem_bruta > 0 ~ "virou pro Paes",
+            venceu_2018 & margem_bruta <= 0 ~ "virou contra"
+        ),
+        ganho_perda = case_when(
+            delta_margem > 0 ~ "ganho",
+            delta_margem < 0 ~ "perda"
+        )
+    ) %>%
+    left_join(nomes_municipio, by = "id_municipio")
+
+
+# variacao da margem no estado inteiro, 2018 (2o turno) -> 2026 (1o turno)
+variacao_estado <- votos_margem %>%
+    filter(nivel == "municipio") %>%
+    group_by(ano) %>%
+    summarise(margem = sum(margem_bruta) / sum(votos_total)) %>%
+    pull(margem) %>%
+    diff()
+
+## definindo estrategia
+votos_estrategia <- votos_margem %>%
+                filter(ano == 2026) %>%
+                mutate(
+                    votos_abertos = reserva_c_transferiveis,                      # quem nao votou em Paes nem em Ruas: indecisos + transferiveis
+                    dificuldade = (votos_abertos - margem_bruta) / (2 * votos_abertos),  # percentual que precisa ganhar dos votos em aberto pra no minimo empatar, assumindo que *todo mundo vota*
+                    potencial = votos_abertos,                            # tamanho do estoque de votos em jogo,
+                    crescimento_relativo = delta_margem - variacao_estado, # quando a margem variou de 2018 pra 2026 em relacao a variacao da margem do estado
+                    tendencia = case_when(
+                            crescimento_relativo >= 0.05 ~ "em alta",
+                            crescimento_relativo <= -0.05 ~ "em baixa",
+                            !is.na(crescimento_relativo) ~ "na media"
+                )
+                ) %>%
+                group_by(nivel) %>%
+                mutate(
+                    quadrante = case_when(
+                        dificuldade <= 0.625 & potencial >= median(potencial) ~ "1.prioridade",
+                        dificuldade <= 0.625 ~ "3.manter",
+                        potencial >= median(potencial) ~ "2.investir",
+                        TRUE ~ "4.baixa prioridade"
+                    ),
+                    
+                ) %>%
+                ungroup()
+## FIM DO BLOCO 1 ##
+```
+```{r}
 
 # desenho dos bairros a partir dos locais de votacao de 2024: cada local fica com a area mais proxima dele
 # (Voronoi), recortada pelo municipio, e as areas sao unidas pelo texto de bairro do TSE
@@ -151,17 +292,76 @@ bairros_voronoi <- municipios %>%
     bind_rows() %>%
     st_transform(4326)
 
-mapa_paes <- bairros_voronoi %>%
-        left_join(paes_bairro, by = c("id_municipio", "bairro"))
-
 ```
 
 ```{r}
-DBI::dbGetQuery(
-    con,
-    "
-     SELECT * FROM br_tse_eleicoes.resultados_candidato_secao LIMIT 10
-    "
-)
+## mapa da estrategia: municipios na vista do estado, bairros ao aproximar
+library(leaflet)
 
-```
+pct <- scales::label_percent(accuracy = 0.1, decimal.mark = ",")
+num <- scales::label_number(big.mark = ".", decimal.mark = ",")
+pp <- scales::label_number(accuracy = 0.1, scale = 100, decimal.mark = ",", style_positive = "plus", suffix = " p.p.")
+
+rotulos_quadrante <- c("1.prioridade" = "1º Prioridade", "2.investir" = "2º Investir", "3.manter" = "3º Manter", "4.baixa prioridade" = "4º Baixa prioridade")
+cores_quadrante <- c("#08306b", "#2171b5", "#6baed6", "#bdbdbd")    # azul forte para fraco: a ordem de prioridade
+pal_quadrante <- colorFactor(cores_quadrante, levels = rotulos_quadrante, na.color = "#f0f0f0")
+
+estrategia_mapa <- votos_estrategia %>%
+    mutate(
+        prioridade = factor(rotulos_quadrante[quadrante], levels = rotulos_quadrante),
+        seta = case_when(
+            tendencia == "em alta" ~ "<span style='color:#1a9641'>▲</span>",
+            tendencia == "em baixa" ~ "<span style='color:#d7191c'>▼</span>",
+            TRUE ~ ""
+        ),
+        rotulo = glue::glue(
+            "<b>{if_else(is.na(bairro), '', paste0(bairro, ' · '))}{nome_municipio}</b><br>",
+            "<b>{prioridade}</b> · tendência: {coalesce(tendencia, 'sem 2018')} {seta}<br><br>",
+            "Paes {num(votos_paes)} x Ruas {num(votos_oposicao)}<br>",
+            "Margem: {pp(margem)} ({num(margem_bruta)} votos)<br>",
+            "Variação da margem desde 2018: {coalesce(pp(delta_margem), 'sem 2018')}<br>",
+            "Paes precisa de {pct(dificuldade)} dos votos abertos para empatar<br>",
+            "Comparecimento: {pct(pct_comparecimento)}<br>",
+            "Reserva (abstenção + brancos + nulos): {num(reserva)}<br>",
+            "Reserva com transferíveis (+ votos em outros candidatos): {num(reserva_c_transferiveis)}"
+        ) %>%
+            as.character()
+    )
+
+# municipio e bairro na mesma camada de geometria; o mapa mostra um ou outro conforme o zoom
+areas <- bind_rows(
+    municipios %>% st_transform(4326) %>% mutate(nivel = "municipio"),
+    bairros_voronoi %>% mutate(nivel = "bairro")
+) %>%
+    st_transform(31983) %>%
+    st_simplify(dTolerance = 30, preserveTopology = TRUE) %>%    # contorno mais leve para o html
+    st_transform(4326) %>%
+    left_join(estrategia_mapa, by = c("nivel", "id_municipio", "bairro")) %>%
+    mutate(rotulo = coalesce(rotulo, paste0("<b>", bairro, "</b><br>sem voto em 2026")))
+
+setas <- areas %>%
+    filter(seta != "") %>%
+    st_transform(31983) %>%
+    st_point_on_surface() %>%                                    # ponto garantidamente dentro da area
+    st_transform(4326)
+
+estilo_seta <- labelOptions(noHide = TRUE, direction = "center", textOnly = TRUE,
+                            style = list("font-size" = "15px", "text-shadow" = "0 0 3px white, 0 0 3px white"))
+
+mapa_estrategia <- leaflet() %>%
+    addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+    addPolygons(data = filter(areas, nivel == "municipio"), group = "municipio", fillColor = ~pal_quadrante(prioridade),
+                fillOpacity = 0.9, color = "white", weight = 1, label = ~lapply(rotulo, htmltools::HTML), highlightOptions = highlightOptions(weight = 3, color = "black")) %>%
+    addPolygons(data = filter(areas, nivel == "bairro"), group = "bairro", fillColor = ~pal_quadrante(prioridade),
+                fillOpacity = 0.9, color = "white", weight = 0.5, label = ~lapply(rotulo, htmltools::HTML), highlightOptions = highlightOptions(weight = 3, color = "black")) %>%
+    addLabelOnlyMarkers(data = filter(setas, nivel == "municipio"), group = "municipio", label = ~lapply(seta, htmltools::HTML), labelOptions = estilo_seta) %>%
+    addLabelOnlyMarkers(data = filter(setas, nivel == "bairro"), group = "setas_bairro", label = ~lapply(seta, htmltools::HTML), labelOptions = estilo_seta) %>%
+    groupOptions("municipio", zoomLevels = 1:9) %>%              # vista do estado: municipios
+    groupOptions("bairro", zoomLevels = 10:18) %>%               # aproximando: bairros
+    groupOptions("setas_bairro", zoomLevels = 11:18) %>%         # setas dos bairros so bem de perto, para nao poluir
+    addLegend(colors = cores_quadrante, labels = rotulos_quadrante, title = "Ordem de prioridade", opacity = 0.9) %>%
+    addLegend(colors = c("#1a9641", "#d7191c"), labels = c("▲ em alta", "▼ em baixa"), title = "Tendência vs. estado", position = "bottomleft", opacity = 0.9)
+
+mapa_estrategia
+htmlwidgets::saveWidget(mapa_estrategia, "mapa_estrategia.html", selfcontained = TRUE)
+

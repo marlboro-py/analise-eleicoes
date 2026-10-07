@@ -1,3 +1,5 @@
+/* cSpell:disable */
+
 ---
 title: "Coleta de dados eleitorais do RJ"
 format: html
@@ -37,6 +39,7 @@ ANOS_RAIS = list(range(2017, 2026))
 DATA_INICIO_1746 = "2017-10-01"
 COLUNAS_1746 = ["id_chamado", "data_inicio", "id_bairro", "categoria", "tipo", "subtipo", "status", "latitude", "longitude"]
 COLUNAS_CENSO_2010 = ["id_municipio", "area_ponderacao", "peso_amostral", "v6121"]   # v6121 = codigo da religiao
+COLUNAS_CENSO_2022 = ["sigla_uf", "peso_amostral", "p0410"]                          # p0410 = religiao; o arquivo publico de 2022 nao tem municipio
 
 # execucao
 BQ_PROJETO = "vozes-do-rio"                                  # id do projeto no Google Cloud que paga as consultas
@@ -90,6 +93,7 @@ EXTRACTIONS = [
     {"table": "basedosdados.br_geobr_mapas.limite_vizinhanca"},                 # contorno dos bairros do IBGE, todos os municipios do estado
     {"table": "basedosdados.br_ibge_censo_demografico.microdados_pessoa_2010", "columns": COLUNAS_CENSO_2010,
      "where": ibge_where},                                                      # religiao por area de ponderacao (amostra de 2010)
+    {"table": "basedosdados.br_ibge_censo_demografico.microdados_pessoa_2022", "columns": COLUNAS_CENSO_2022},  # religiao no estado (amostra de 2022, so ate UF)
 ]
 ```
 
@@ -224,6 +228,14 @@ print(con.sql("""
     SELECT id_municipio, COUNT(*) AS pessoas_na_amostra, CAST(ROUND(SUM(peso_amostral)) AS BIGINT) AS populacao_estimada,
            COUNT(DISTINCT area_ponderacao) AS areas_ponderacao, COUNT(DISTINCT v6121) AS codigos_religiao
     FROM br_ibge_censo_demografico.microdados_pessoa_2010
+    GROUP BY ALL ORDER BY ALL
+"""))
+
+# 4. a amostra do Censo 2022, ponderada, reproduz a populacao do estado?
+print(con.sql("""
+    SELECT sigla_uf, COUNT(*) AS pessoas_na_amostra, CAST(ROUND(SUM(peso_amostral)) AS BIGINT) AS populacao_estimada,
+           COUNT(DISTINCT p0410) AS codigos_religiao
+    FROM br_ibge_censo_demografico.microdados_pessoa_2022
     GROUP BY ALL ORDER BY ALL
 """))
 ```
