@@ -22,5 +22,5 @@ Tudo está no bloco `parametros` e na lista `EXTRACTIONS` do caderno.
 
 - Estado inteiro em vez da capital: `MUNICIPIOS_TSE = []`.
 - Mais uma tabela: acrescente uma linha em `EXTRACTIONS`.
-- Atualizar 2026 depois do segundo turno: apague os arquivos `*_2026.parquet` e rode de novo.
+- Atualizar 2026 depois do segundo turno: apague os arquivos `*_2026.parquet` e rode de novo. Vale também para `despesas_candidato`, que em 2026 traz só a prestação de contas parcial até a final ser publicada.
 - Guardar título eleitoral e CPF em claro: `HASH_PII = False`.

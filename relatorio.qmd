@@ -6,153 +6,270 @@ library(duckdb)
 library(here)
 library(DBI)
 library(sf)
+library(leaflet)
 
 con <- DBI::dbConnect(duckdb::duckdb(), here("repos/eleicoes/dfs/eleicoes_rj_uf.duckdb"), read_only = TRUE)
 
-## BLOCO 1
-## Mudança de voto pro Paes - bairro a bairro (pêndulos, derrotas, crescimento), se der tempo, incluir dado socio economico
+## PARAMETROS
+## o que define a estrategia: os valores sao os combinados ate aqui, e mudar um deles refaz o relatorio inteiro
+
+# bloco 1: quadrante (dificuldade x potencial) e tendencia de cada bairro e municipio
+DIFICULDADE_MAXIMA <- 0.60      # viavel (quadrantes 1 e 3): o Paes empata com ate 60% dos votos em jogo
+QUANTIL_POTENCIAL <- 0.5        # potencial alto (quadrantes 1 e 2): votos em jogo a partir desse quantil, dentro do nivel (0.5 = mediana)
+LIMIAR_TENDENCIA <- 0.05        # em alta / em baixa: a margem variou 5 p.p. a mais / a menos que a do estado
+
+# bloco 2 (e quem e aliado no bloco 3): campo de cada partido pela coligacao do Paes e do Ruas em 2026 (partidos.composicao_coligacao)
+# siglas antigas passam pelo de-para, para ler 2020/2022/2024 com o alinhamento de hoje
+PARTIDOS_ALIADOS <- c("PSD", "PDT", "MDB", "DC", "PSB", "PSDB", "CIDADANIA", "PT", "PC do B", "PV", "PRD", "SOLIDARIEDADE",
+                      "DEM")                                 # o DEM (ate 2021) era o partido do Paes: aliado, e nao neutro via UNIAO
+PARTIDOS_OPOSICAO <- c("PL", "MOBILIZA", "AGIR", "AVANTE")
+PARTIDOS_NEUTROS <- c("UNIÃO", "PP", "REPUBLICANOS", "PODE")    # sem coligacao de governador e divididos na pratica (imprensa, 2026)
+DE_PARA_SIGLA <- c("PCDOB" = "PC do B", "PPL" = "PC do B", "PTB" = "PRD", "PATRIOTA" = "PRD", "PRP" = "PRD",
+                   "PMN" = "MOBILIZA", "PTC" = "AGIR", "PROS" = "SOLIDARIEDADE", "PHS" = "PODE", "PSC" = "PODE",
+                   "PSL" = "UNIÃO")
+
+# bloco 3: quem mandar para onde
+QUADRANTES_ALVO <- c("1.prioridade", "2.investir")   # bairros que recebem acao de rua
+PISO_VQE_DEPUTADO <- 0.2        # nao eleito so entra com o v/QE da propria candidatura a partir do piso
+PISO_VQE_VEREADOR <- 0.5
+FATIA_MINIMA_BAIRRO <- 0.01     # f: pelo menos 1% dos validos do cargo no bairro, para nao entrar quem nao existe ali
+QL_MINIMO <- 2                  # deputado: so onde e pelo menos 2 vezes mais forte que no estado
+FATIA_MINIMA_MUNICIPIO <- 0.10  # deputado: so nos municipios-base dele (pelo menos 10% do voto total)
+TOP_BAIRRO <- 3                 # quantos aliados por bairro e cargo
+
+## FUNCOES
+
+# a linha do municipio soma as dos bairros dele (colunas votos_*); nivel diz qual e qual
+com_municipio <- function(df) {
+    bind_rows(
+        df %>%
+            mutate(nivel = "bairro"),
+        df %>%
+            group_by(ano, id_municipio) %>%
+            summarise(across(starts_with("votos"), ~ sum(.x, na.rm = TRUE)), .groups = "drop") %>%
+            mutate(nivel = "municipio")
+    )
+}
+
+# compara cada area com a eleicao anterior dela sem pivot: lag pega a linha do ano anterior
+# ... recebe outras comparacoes com a linha anterior (venceu_2018 = lag(margem_bruta > 0), por exemplo)
+variacao <- function(df, cols, ..., by = c("nivel", "id_municipio", "bairro")) {
+    df %>%
+        arrange(ano) %>%
+        group_by(across(all_of(by))) %>%
+        mutate(across({{ cols }}, ~ .x - lag(.x), .names = "delta_{.col}"), ...) %>%
+        ungroup()
+}
+
+# variacao da margem no estado inteiro entre as duas eleicoes (soma dos municipios): a regua do crescimento relativo
+variacao_margem_estado <- function(df, saldo, total) {
+    df %>%
+        filter(nivel == "municipio") %>%
+        group_by(ano) %>%
+        summarise(margem = sum({{ saldo }}) / sum({{ total }})) %>%
+        pull(margem) %>%
+        diff()
+}
+
+# crescimento relativo: quanto a margem do lugar variou alem da variacao do estado
+classificar_tendencia <- function(crescimento_relativo) {
+    case_when(
+        crescimento_relativo >= LIMIAR_TENDENCIA ~ "em alta",
+        crescimento_relativo <= -LIMIAR_TENDENCIA ~ "em baixa",
+        !is.na(crescimento_relativo) ~ "na media"
+    )
+}
+
+# quadrante: viavel pela dificuldade, potencial alto pelo quantil dos votos em jogo (rodar agrupado por nivel)
+classificar_quadrante <- function(dificuldade, potencial) {
+    viavel <- dificuldade <= DIFICULDADE_MAXIMA
+    alto <- potencial >= quantile(potencial, QUANTIL_POTENCIAL, names = FALSE)
+    case_when(
+        viavel & alto ~ "1.prioridade",
+        alto ~ "2.investir",
+        viavel ~ "3.manter",
+        TRUE ~ "4.baixa prioridade"
+    )
+}
+
+campo_partido <- function(sigla) {
+    sigla <- coalesce(unname(DE_PARA_SIGLA[sigla]), sigla)
+    case_when(
+        is.na(sigla) ~ NA_character_,
+        sigla %in% PARTIDOS_ALIADOS ~ "aliado",
+        sigla %in% PARTIDOS_OPOSICAO ~ "oposicao",
+        sigla %in% PARTIDOS_NEUTROS ~ "neutro",
+        TRUE ~ "outros"
+    )
+}
+```
+```{r}
+## BASES
+## tudo que o relatorio le do banco por bairro passa por aqui: secao -> bairro uma vez, cada bloco so filtra
+
+# secao -> bairro: o texto de bairro do TSE, normalizado, e a chave de todo recorte por bairro
+# (o 2o turno repete as secoes, os bairros e os eleitores do 1o; a ligacao segue o turno de cada voto)
+# nome, endereco e cep do local: para o mapa achar o mesmo local entre anos e geocodificar o que nao tem coordenada
+sql_secao_bairro <- "
+    SELECT  ano,
+            turno,
+            id_municipio_tse,
+            id_municipio,
+            zona,
+            secao,
+            numero,
+            STRIP_ACCENTS(UPPER(TRIM(bairro))) bairro,
+            nome,
+            endereco,
+            cep,
+            latitude,
+            longitude,
+            eleitores_secao
+    FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
+"
+
+# eleicoes usadas no relatorio: governador e presidente (bloco 1), deputados e vereador (bloco 3)
+sql_recortes <- "
+    (cargo = 'governador' AND ((ano = 2018 AND turno = 2) OR (ano = 2026 AND turno = 1)))
+    OR (cargo = 'presidente' AND ano IN (2022, 2026) AND turno = 1)
+    OR (cargo IN ('deputado estadual', 'deputado federal') AND ano = 2026)
+    OR (cargo = 'vereador' AND ano = 2024)
+"
+
+# votos por bairro: uma linha por candidato (tipo nominal) e uma por legenda de partido (tipo legenda, sem candidato)
 votos_bairro <- DBI::dbGetQuery(
     con,
-    "
-    WITH b AS (
-        SELECT  ano,
-                id_municipio_tse,
-                id_municipio,
-                zona,
-                secao,
-                turno,
-                STRIP_ACCENTS(UPPER(TRIM(bairro))) bairro,
-                eleitores_secao
-        FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
-    ), 
-    e AS (
-        SELECT  ano,
-                turno,
-                id_municipio_tse,
-                bairro,
-                SUM(eleitores_secao) eleitores
-        FROM b
-        GROUP BY 1, 2, 3, 4
-    ), 
-    v AS (
-        SELECT  r.ano,
-                r.turno,
-                r.numero_candidato,
-                b.bairro,
-                b.id_municipio,
-                b.id_municipio_tse,
-                SUM(r.votos) votos
-        FROM br_tse_eleicoes.resultados_candidato_secao r
-        LEFT JOIN b
-            ON r.ano = b.ano
-            AND r.id_municipio_tse = b.id_municipio_tse
-            AND r.zona = b.zona
-            AND r.secao = b.secao
-            AND r.turno = b.turno
-        WHERE (r.ano = 2018 AND r.turno = 2 AND cargo = 'governador') OR (r.ano = 2026 AND r.turno = 1 AND cargo = 'governador')
-        GROUP BY 1, 2, 3, 4, 5, 6
-    ),
-    c AS (
-        SELECT  d.ano,
-                d.turno,
-                b.id_municipio_tse,
-                b.bairro,
-                SUM(d.aptos) aptos,
-                SUM(d.comparecimento) comparecimento,
-                SUM(d.abstencoes) abstencoes,
-                SUM(d.votos_brancos) brancos,
-                SUM(d.votos_nulos) nulos
-        FROM br_tse_eleicoes.detalhes_votacao_secao d
-        LEFT JOIN b
-            ON d.ano = b.ano
-            AND d.id_municipio_tse = b.id_municipio_tse
-            AND d.zona = b.zona
-            AND d.secao = b.secao
-            AND d.turno = b.turno
-        WHERE (d.ano = 2018 AND d.turno = 2 AND d.cargo = 'governador') OR (d.ano = 2026 AND d.turno = 1 AND d.cargo = 'governador')
-        GROUP BY 1, 2, 3, 4
-    )
+    glue::glue(
+        "
+        WITH b AS ({sql_secao_bairro}),
+        v AS (
+            SELECT  *
+            FROM (
+                SELECT  'nominal' tipo, ano, turno, cargo, id_municipio_tse, zona, secao, sigla_partido, numero_candidato, sequencial_candidato sequencial, votos
+                FROM br_tse_eleicoes.resultados_candidato_secao
+                UNION ALL
+                SELECT  'legenda', ano, turno, cargo, id_municipio_tse, zona, secao, sigla_partido, NULL, NULL, votos_legenda
+                FROM br_tse_eleicoes.resultados_partido_secao
+            )
+            WHERE {sql_recortes}
+        )
 
-    SELECT  v.*,
-            e.eleitores,
-            c.aptos,
-            c.comparecimento,
-            c.abstencoes,
-            c.brancos,
-            c.nulos
-    FROM v
-    LEFT JOIN e 
-        ON v.ano = e.ano 
-        AND v.turno = e.turno 
-        AND v.id_municipio_tse = e.id_municipio_tse 
-        AND v.bairro = e.bairro
-    LEFT JOIN c
-        ON v.ano = c.ano
-        AND v.turno = c.turno
-        AND v.id_municipio_tse = c.id_municipio_tse
-        AND v.bairro = c.bairro
-    "
+        SELECT  v.tipo,
+                v.ano,
+                v.turno,
+                v.cargo,
+                b.id_municipio,
+                b.bairro,
+                v.sigla_partido,
+                v.numero_candidato,
+                v.sequencial,
+                SUM(v.votos) votos
+        FROM v
+        JOIN b
+            ON v.ano = b.ano
+            AND v.turno = b.turno
+            AND v.id_municipio_tse = b.id_municipio_tse
+            AND v.zona = b.zona
+            AND v.secao = b.secao
+        GROUP BY ALL
+        "
+    )
 )
 
+# eleitores, aptos, comparecimento, abstencao, brancos e nulos por bairro, nas mesmas eleicoes
+comparecimento_bairro <- DBI::dbGetQuery(
+    con,
+    glue::glue(
+        "
+        WITH b AS ({sql_secao_bairro}),
+        e AS (
+            SELECT  ano,
+                    turno,
+                    id_municipio,
+                    bairro,
+                    SUM(eleitores_secao) eleitores
+            FROM b
+            GROUP BY ALL
+        ),
+        c AS (
+            SELECT  d.ano,
+                    d.turno,
+                    d.cargo,
+                    b.id_municipio,
+                    b.bairro,
+                    SUM(d.aptos) aptos,
+                    SUM(d.comparecimento) comparecimento,
+                    SUM(d.abstencoes) abstencoes,
+                    SUM(d.votos_brancos) brancos,
+                    SUM(d.votos_nulos) nulos
+            FROM (SELECT * FROM br_tse_eleicoes.detalhes_votacao_secao WHERE {sql_recortes}) d
+            JOIN b
+                ON d.ano = b.ano
+                AND d.turno = b.turno
+                AND d.id_municipio_tse = b.id_municipio_tse
+                AND d.zona = b.zona
+                AND d.secao = b.secao
+            GROUP BY ALL
+        )
+
+        SELECT  c.ano,
+                c.turno,
+                c.cargo,
+                c.id_municipio,
+                c.bairro,
+                e.eleitores,
+                c.aptos,
+                c.comparecimento,
+                c.abstencoes,
+                c.brancos,
+                c.nulos
+        FROM c
+        LEFT JOIN e
+            USING (ano, turno, id_municipio, bairro)
+        "
+    )
+)
+
+# perfil do eleitorado por bairro e por municipio: genero, idade e instrucao
 perfil_bairro <- DBI::dbGetQuery(
     con,
-    "
-    WITH b AS (
-        SELECT  ano,
-                id_municipio_tse,
-                id_municipio,
-                zona,
-                secao,
-                turno,
-                STRIP_ACCENTS(UPPER(TRIM(bairro))) bairro
-        FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
-    ),
-    p AS (
-        SELECT  *,
-                TRY_CAST(LEFT(grupo_idade, 2) AS INT) idade_min   -- 1600 = 16 anos, 2124 = 21 a 24, 9999 = 100 ou mais
-        FROM br_tse_eleicoes.perfil_eleitorado_secao
-        WHERE ano IN (2018, 2026)
+    glue::glue(
+        "
+        WITH b AS ({sql_secao_bairro}),
+        p AS (
+            SELECT  *,
+                    TRY_CAST(LEFT(grupo_idade, 2) AS INT) idade_min   -- 1600 = 16 anos, 2124 = 21 a 24, 9999 = 100 ou mais
+            FROM br_tse_eleicoes.perfil_eleitorado_secao
+            WHERE ano IN (2018, 2026)
+        )
+
+        -- o perfil do eleitorado e um por ano (nao tem turno): liga a secao ao bairro pelo 1o turno
+        -- grouping sets: uma linha por bairro e outra por municipio (bairro nulo), como no votos_margem
+        SELECT  p.ano,
+                IF(GROUPING(b.bairro) = 1, 'municipio', 'bairro') nivel,
+                b.id_municipio,
+                b.bairro,
+                SUM(p.eleitores) eleitores_perfil,
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.genero = '4'), 0) / SUM(p.eleitores) pct_mulheres,      -- 2 masculino, 4 feminino, 0 nao informado
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 16 AND 24), 0) / SUM(p.eleitores) pct_16_24,
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 25 AND 34), 0) / SUM(p.eleitores) pct_25_34,
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 35 AND 44), 0) / SUM(p.eleitores) pct_35_44,
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 45 AND 59), 0) / SUM(p.eleitores) pct_45_59,
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min >= 60), 0) / SUM(p.eleitores) pct_60_mais,
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min >= 70), 0) / SUM(p.eleitores) pct_70_mais,      -- voto facultativo: nao e cancelado por ausencia
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.instrucao IN ('7', '8')), 0) / SUM(p.eleitores) pct_superior,              -- 7 superior incompleto, 8 completo
+                COALESCE(SUM(p.eleitores) FILTER (WHERE p.instrucao IN ('1', '2', '3')), 0) / SUM(p.eleitores) pct_ate_fund_incompleto -- analfabeto, le e escreve, fundamental incompleto
+        FROM p
+        JOIN b
+            ON p.ano = b.ano
+            AND p.id_municipio_tse = b.id_municipio_tse
+            AND p.zona = b.zona
+            AND p.secao = b.secao
+            AND b.turno = 1
+        GROUP BY GROUPING SETS ((p.ano, b.id_municipio, b.bairro), (p.ano, b.id_municipio))
+        "
     )
-
-    -- o perfil do eleitorado e um por ano (nao tem turno): liga a secao ao bairro pelo 1o turno
-    SELECT  p.ano,
-            b.id_municipio,
-            b.bairro,
-            SUM(p.eleitores) eleitores_perfil,
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.genero = '4'), 0) / SUM(p.eleitores) pct_mulheres,      -- 2 masculino, 4 feminino, 0 nao informado
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 16 AND 24), 0) / SUM(p.eleitores) pct_16_24,
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 25 AND 34), 0) / SUM(p.eleitores) pct_25_34,
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 35 AND 44), 0) / SUM(p.eleitores) pct_35_44,
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min BETWEEN 45 AND 59), 0) / SUM(p.eleitores) pct_45_59,
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.idade_min >= 60), 0) / SUM(p.eleitores) pct_60_mais,
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.instrucao IN ('7', '8')), 0) / SUM(p.eleitores) pct_superior,              -- 7 superior incompleto, 8 completo
-            COALESCE(SUM(p.eleitores) FILTER (WHERE p.instrucao IN ('1', '2', '3')), 0) / SUM(p.eleitores) pct_ate_fund_incompleto -- analfabeto, le e escreve, fundamental incompleto
-    FROM p
-    JOIN b
-        ON p.ano = b.ano
-        AND p.id_municipio_tse = b.id_municipio_tse
-        AND p.zona = b.zona
-        AND p.secao = b.secao
-        AND b.turno = 1
-    GROUP BY 1, 2, 3
-    "
 )
-
-votos_bairro <- votos_bairro %>%
-                    mutate(
-                        paes = (ano == 2018 & numero_candidato == "25") | (ano == 2026 & numero_candidato == "55"),
-                        oposicao = (ano == 2018 & numero_candidato == "20")  | (ano == 2026 & numero_candidato == "22"),
-                        transferivel = !paes & !oposicao
-                    ) %>%
-                    group_by(ano, id_municipio, bairro) %>%
-                    summarise(
-                        votos_paes = sum(votos[paes]),
-                        votos_oposicao = sum(votos[oposicao]),
-                        votos_transferiveis = sum(votos[transferivel]),
-                        votos_total = sum(votos),
-                        across(eleitores:nulos, ~ max(.x, na.rm = TRUE), .names = "votos_{.col}_total"),
-                        .groups = "drop"
-                    ) 
 
 nomes_municipio <- DBI::dbGetQuery(
     con,
@@ -164,31 +281,100 @@ nomes_municipio <- DBI::dbGetQuery(
     "
 )
 
-votos_margem <- bind_rows(
-        votos_bairro %>% 
-            mutate(nivel = "bairro"),
-        votos_bairro %>%
-            group_by(ano, id_municipio) %>%
-            summarise(across(starts_with("votos"), ~ sum(.x, na.rm = TRUE)), .groups = "drop") %>%
-            mutate(nivel = "municipio")
+## a mesma pessoa entre candidaturas: toda analise candidato a candidato liga por id_pessoa, nunca por nome ou sequencial
+# base e o titulo eleitoral; o nome + nascimento e o cpf ligam quando o titulo vem vazio ou com digito trocado entre anos
+pessoas_tse <- DBI::dbGetQuery(
+    con,
+    "
+    WITH c AS (
+        SELECT  ano,
+                sequencial,
+                NULLIF(TRIM(titulo_eleitoral), '') titulo,
+                NULLIF(NULLIF(TRIM(cpf), ''), '-1') cpf,
+                STRIP_ACCENTS(UPPER(TRIM(nome))) nome,
+                data_nascimento
+        FROM br_tse_eleicoes.candidatos
+    ),
+    n AS (
+        SELECT  *,
+                COALESCE(IF(data_nascimento IS NULL, NULL, MAX(titulo) OVER (PARTITION BY nome, data_nascimento)), titulo) titulo_nome
+        FROM c
+    )
+    SELECT  DISTINCT ano,
+            sequencial,
+            COALESCE(IF(cpf IS NULL, NULL, MAX(titulo_nome) OVER (PARTITION BY cpf)), titulo_nome, 'seq' || sequencial) id_pessoa
+    FROM n
+    "
+)
+duckdb::duckdb_register(con, "pessoas_tse", pessoas_tse)   # para as queries poderem ligar por id_pessoa
+
+# candidaturas com resultado: prefeito e vereador (2020, 2024) para o bloco 2, deputados (2026) e vereador (2024) para o bloco 3
+candidaturas <- DBI::dbGetQuery(
+    con,
+    "
+    SELECT  r.ano,
+            r.cargo,
+            r.id_municipio,
+            r.sequencial_candidato sequencial,
+            p.id_pessoa,
+            r.nome_candidato,
+            c.nome_urna,
+            r.sigla_partido,
+            r.resultado,
+            r.votos votos_total
+    FROM br_tse_eleicoes.resultados_candidato r
+    LEFT JOIN br_tse_eleicoes.candidatos c
+        ON r.ano = c.ano
+        AND r.sequencial_candidato = c.sequencial
+    LEFT JOIN pessoas_tse p
+        ON r.ano = p.ano
+        AND r.sequencial_candidato = p.sequencial
+    WHERE (r.ano IN (2020, 2024) AND r.cargo IN ('prefeito', 'vereador')) OR (r.ano = 2026 AND r.cargo IN ('deputado estadual', 'deputado federal'))
+    "
+)
+
+vagas <- DBI::dbGetQuery(con, "SELECT ano, cargo, id_municipio, vagas FROM br_tse_eleicoes.vagas WHERE ano IN (2024, 2026)")
+```
+```{r}
+## BLOCO 1
+## Mudança de voto pro Paes - bairro a bairro (pêndulos, derrotas, crescimento), se der tempo, incluir dado socio economico
+
+# governador: Paes (25 em 2018, 55 em 2026) contra a oposicao (20 em 2018, 22 em 2026), 2018 (2o turno) -> 2026 (1o turno)
+governador_bairro <- votos_bairro %>%
+    filter(cargo == "governador", tipo == "nominal") %>%
+    mutate(
+        paes = (ano == 2018 & numero_candidato == "25") | (ano == 2026 & numero_candidato == "55"),
+        oposicao = (ano == 2018 & numero_candidato == "20")  | (ano == 2026 & numero_candidato == "22"),
+        transferivel = !paes & !oposicao
     ) %>%
+    group_by(ano, id_municipio, bairro) %>%
+    summarise(
+        votos_paes = sum(votos[paes]),
+        votos_oposicao = sum(votos[oposicao]),
+        votos_transferiveis = sum(votos[transferivel]),
+        votos_total = sum(votos),
+        .groups = "drop"
+    ) %>%
+    left_join(
+        comparecimento_bairro %>%
+            filter(cargo == "governador") %>%
+            select(ano, id_municipio, bairro, eleitores:nulos) %>%
+            rename_with(~ paste0("votos_", .x, "_total"), eleitores:nulos),
+        by = c("ano", "id_municipio", "bairro")
+    )
+
+votos_margem <- governador_bairro %>%
+    com_municipio() %>%
     mutate(
         pct_paes = votos_paes / votos_total,
         margem_bruta = votos_paes - votos_oposicao,       # > 0: Paes venceu
         margem = margem_bruta / votos_total,
-        reserva = votos_abstencoes_total + votos_brancos_total + votos_nulos_total,           # eleitores que nao escolheram ninguem
+        reserva = votos_brancos_total + votos_nulos_total,          # foram votar e nao escolheram ninguem; a abstencao fica de fora (tende a ser estavel) e aparece separada
         reserva_c_transferiveis = reserva + votos_transferiveis,
         pct_abstencao = votos_abstencoes_total / votos_aptos_total,
         pct_comparecimento = votos_comparecimento_total / votos_aptos_total   # mesmo denominador da proporcao_comparecimento do TSE
     ) %>%
-    # compara 2026 com 2018 na mesma area sem pivot: lag pega a linha de 2018
-    arrange(ano) %>%
-    group_by(nivel, id_municipio, bairro) %>%
-    mutate(
-        across(c(votos_paes, pct_paes, margem_bruta, margem, pct_abstencao), ~ .x - lag(.x), .names = "delta_{.col}"),
-        venceu_2018 = lag(margem_bruta > 0)
-    ) %>%
-    ungroup() %>%
+    variacao(c(votos_paes, pct_paes, margem_bruta, margem, pct_abstencao), venceu_2018 = lag(margem_bruta > 0)) %>%
     mutate(
         perfil = case_when(
             venceu_2018 & margem_bruta > 0 ~ "reduto",
@@ -203,68 +389,385 @@ votos_margem <- bind_rows(
     ) %>%
     left_join(nomes_municipio, by = "id_municipio")
 
+variacao_estado <- variacao_margem_estado(votos_margem, margem_bruta, votos_total)
 
-# variacao da margem no estado inteiro, 2018 (2o turno) -> 2026 (1o turno)
-variacao_estado <- votos_margem %>%
-    filter(nivel == "municipio") %>%
-    group_by(ano) %>%
-    summarise(margem = sum(margem_bruta) / sum(votos_total)) %>%
-    pull(margem) %>%
-    diff()
+# Lula (13) contra o 22 no 1o turno, 2022 -> 2026, no mesmo recorte de bairro: margem e tendencia do presidente
+votos_presidente <- votos_bairro %>%
+    filter(cargo == "presidente", tipo == "nominal") %>%
+    group_by(ano, id_municipio, bairro) %>%
+    summarise(
+        votos_lula = sum(votos[numero_candidato == "13"]),
+        votos_22 = sum(votos[numero_candidato == "22"]),
+        votos_total_presidente = sum(votos),
+        .groups = "drop"
+    ) %>%
+    com_municipio() %>%
+    mutate(margem_lula = (votos_lula - votos_22) / votos_total_presidente) %>%
+    variacao(margem_lula)
+
+variacao_estado_lula <- variacao_margem_estado(votos_presidente, votos_lula - votos_22, votos_total_presidente)
 
 ## definindo estrategia
 votos_estrategia <- votos_margem %>%
-                filter(ano == 2026) %>%
-                mutate(
-                    votos_abertos = reserva_c_transferiveis,                      # quem nao votou em Paes nem em Ruas: indecisos + transferiveis
-                    dificuldade = (votos_abertos - margem_bruta) / (2 * votos_abertos),  # percentual que precisa ganhar dos votos em aberto pra no minimo empatar, assumindo que *todo mundo vota*
-                    potencial = votos_abertos,                            # tamanho do estoque de votos em jogo,
-                    crescimento_relativo = delta_margem - variacao_estado, # quando a margem variou de 2018 pra 2026 em relacao a variacao da margem do estado
-                    tendencia = case_when(
-                            crescimento_relativo >= 0.05 ~ "em alta",
-                            crescimento_relativo <= -0.05 ~ "em baixa",
-                            !is.na(crescimento_relativo) ~ "na media"
-                )
-                ) %>%
-                group_by(nivel) %>%
-                mutate(
-                    quadrante = case_when(
-                        dificuldade <= 0.625 & potencial >= median(potencial) ~ "1.prioridade",
-                        dificuldade <= 0.625 ~ "3.manter",
-                        potencial >= median(potencial) ~ "2.investir",
-                        TRUE ~ "4.baixa prioridade"
-                    ),
-                    
-                ) %>%
-                ungroup()
+    filter(ano == 2026) %>%
+    mutate(
+        votos_abertos = reserva_c_transferiveis,                      # quem votou e nao foi de Paes nem de Ruas: brancos, nulos + transferiveis
+        dificuldade = (votos_abertos - margem_bruta) / (2 * votos_abertos),  # percentual que precisa ganhar dos votos em aberto pra no minimo empatar, assumindo que a abstencao se repete (> 1: nao empata so com os abertos)
+        potencial = votos_abertos,                            # tamanho do estoque de votos em jogo
+        crescimento_relativo = delta_margem - variacao_estado, # quanto a margem variou de 2018 pra 2026 em relacao a variacao da margem do estado
+        tendencia = classificar_tendencia(crescimento_relativo)
+    ) %>%
+    group_by(nivel) %>%                                       # o potencial alto e relativo: bairro contra bairro, municipio contra municipio
+    mutate(quadrante = classificar_quadrante(dificuldade, potencial)) %>%
+    ungroup() %>%
+    left_join(
+        votos_presidente %>%
+            filter(ano == 2026) %>%
+            select(nivel, id_municipio, bairro, margem_lula, delta_margem_lula),
+        by = c("nivel", "id_municipio", "bairro")
+    ) %>%
+    mutate(
+        crescimento_relativo_lula = delta_margem_lula - variacao_estado_lula,   # mesma regua do Paes: variacao do lugar menos a do estado
+        tendencia_lula = classificar_tendencia(crescimento_relativo_lula)
+    ) %>%
+    # perfil do eleitorado de 2026: so informacao, nao entra na dificuldade nem no quadrante
+    left_join(
+        perfil_bairro %>%
+            filter(ano == 2026) %>%
+            select(-ano),
+        by = c("nivel", "id_municipio", "bairro")
+    )
 ## FIM DO BLOCO 1 ##
 ```
 ```{r}
+## BLOCO 2
+## Prefeituras e camaras de vereadores: quem governa cada municipio, quem tem a camara e se sao aliados do Paes
 
-# desenho dos bairros a partir dos locais de votacao de 2024: cada local fica com a area mais proxima dele
-# (Voronoi), recortada pelo municipio, e as areas sao unidas pelo texto de bairro do TSE
+# prefeito eleito em 2020 e em 2024: um por municipio (em 2020 a suplementar ja vem como o eleito)
+# Itaguai, Tres Rios, Natividade e Silva Jardim nao tem eleito em 2024 na base: o prefeito de hoje vem do csv de apoios
+prefeitos <- candidaturas %>%
+    filter(cargo == "prefeito", resultado == "eleito") %>%
+    group_by(id_municipio) %>%
+    summarise(
+        partido_prefeito_2020 = first(sigla_partido[ano == 2020]),
+        partido_prefeito_2024 = first(sigla_partido[ano == 2024]),
+        prefeito_2024 = first(nome_candidato[ano == 2024]),
+        reeleito = n_distinct(id_pessoa, na.rm = TRUE) == 1 & n() == 2
+    ) %>%
+    mutate(mudou_partido = partido_prefeito_2020 != partido_prefeito_2024)
+
+# apoio do prefeito em 2026, levantado na imprensa: vale mais que a sigla, porque atravessa partidos
+# (PP, Uniao e Republicanos com Paes na Baixada); sem apoio levantado, vale a sigla de 2024
+apoios_prefeitos <- read_csv(here("repos/eleicoes/dfs/apoios_prefeitos.csv"), show_col_types = FALSE) %>%
+    left_join(nomes_municipio, by = c("municipio" = "nome_municipio")) %>%
+    select(id_municipio, prefeito_atual, apoio, evidencia)
+
+prefeitos <- prefeitos %>%
+    full_join(apoios_prefeitos, by = "id_municipio") %>%
+    mutate(campo_prefeito = coalesce(recode(apoio, paes = "aliado", ruas = "oposicao"), campo_partido(partido_prefeito_2024)))
+
+# bancadas de cada camara em 2020 e 2024 (os eleitos batem com as vagas da tabela vagas nos 92 municipios)
+bancadas <- candidaturas %>%
+    filter(cargo == "vereador", str_starts(resultado, "eleito")) %>%
+    count(ano, id_municipio, sigla_partido, name = "cadeiras") %>%
+    mutate(campo = campo_partido(sigla_partido))
+
+camaras <- bancadas %>%
+    group_by(ano, id_municipio) %>%
+    summarise(
+        cadeiras_psd = sum(cadeiras[sigla_partido == "PSD"]),
+        cadeiras_aliado = sum(cadeiras[campo == "aliado"]),       # PSD conta dentro dos aliados
+        cadeiras_oposicao = sum(cadeiras[campo == "oposicao"]),
+        cadeiras_neutro = sum(cadeiras[campo == "neutro"]),
+        maior_bancada = if (sum(cadeiras == max(cadeiras)) > 1) "empate" else sigla_partido[which.max(cadeiras)],   # mais de um partido com o maior numero de cadeiras: empate
+        cadeiras = sum(cadeiras),                                  # por ultimo: daqui pra baixo cadeiras vira o total
+        .groups = "drop"
+    ) %>%
+    mutate(
+        pct_aliado = cadeiras_aliado / cadeiras,
+        pct_oposicao = cadeiras_oposicao / cadeiras,
+        maioria = case_when(                                       # maioria = mais da metade das cadeiras
+            pct_aliado > 0.5 ~ "aliada",
+            pct_oposicao > 0.5 ~ "oposicao",
+            TRUE ~ "sem maioria"
+        )
+    ) %>%
+    # 2024 contra 2020 na mesma camara
+    variacao(c(cadeiras_aliado, cadeiras_oposicao), maioria_2020 = lag(maioria), by = "id_municipio") %>%
+    filter(ano == 2024) %>%
+    select(-ano)
+
+municipios_campo <- votos_estrategia %>%
+    filter(nivel == "municipio") %>%
+    select(id_municipio, nome_municipio, votos_aptos = votos_aptos_total, pct_paes, margem, delta_margem, quadrante) %>%
+    left_join(prefeitos, by = "id_municipio") %>%
+    left_join(camaras, by = "id_municipio") %>%
+    mutate(
+        situacao = case_when(
+            campo_prefeito == "aliado" & maioria == "aliada" ~ "1.prefeito e camara aliados",
+            campo_prefeito == "aliado" ~ "2.so o prefeito aliado",
+            maioria == "aliada" ~ "3.so a camara aliada",
+            TRUE ~ "4.nenhum dos dois aliado"
+        ),
+        # virou ou nao virou aliado: o prefeito de 2020 pela sigla (alinhamento de 2026) contra o campo de hoje; a camara pela maioria
+        campo_prefeito_2020 = campo_partido(partido_prefeito_2020),
+        mudanca_prefeito = case_when(
+            campo_prefeito_2020 %in% "aliado" & campo_prefeito %in% "aliado" ~ "já era aliado",
+            campo_prefeito %in% "aliado" ~ "virou aliado",
+            campo_prefeito_2020 %in% "aliado" ~ "deixou de ser aliado",
+            TRUE ~ "segue não aliado"
+        ),
+        mudanca_camara = case_when(
+            maioria_2020 %in% "aliada" & maioria %in% "aliada" ~ "segue aliada",
+            maioria %in% "aliada" ~ "virou aliada",
+            maioria_2020 %in% "aliada" ~ "deixou de ser aliada",
+            TRUE ~ "segue sem maioria aliada"
+        )
+    )
+
+# o resumo do slide: em quantos municipios (e eleitores) o campo tem prefeito e camara, e como o Paes foi em cada caso
+resumo_municipios <- municipios_campo %>%
+    group_by(situacao) %>%
+    summarise(
+        municipios = n(),
+        eleitores = sum(votos_aptos, na.rm = TRUE),
+        margem_paes = weighted.mean(margem, votos_aptos, na.rm = TRUE),
+        delta_margem_paes = weighted.mean(delta_margem, votos_aptos, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+# prefeitos por campo hoje, e quanto disso vem de apoio levantado (declarado ou indicio) e quanto so da sigla
+resumo_prefeitos <- municipios_campo %>%
+    group_by(campo_prefeito, evidencia = coalesce(evidencia, "sigla")) %>%
+    summarise(municipios = n(), eleitores = sum(votos_aptos, na.rm = TRUE), .groups = "drop")
+
+# vereadores no estado inteiro por campo, 2020 -> 2024
+# 2020 le cada partido com o alinhamento de 2026, menos o DEM, que era o partido do Paes e conta como aliado
+resumo_camaras <- bancadas %>%
+    group_by(ano, campo) %>%
+    summarise(cadeiras = sum(cadeiras), .groups = "drop") %>%
+    group_by(ano) %>%
+    mutate(pct = cadeiras / sum(cadeiras)) %>%
+    ungroup()
+## FIM DO BLOCO 2 ##
+```
+```{r}
+## BLOCO 3
+## Acoes de rua no 2o turno: quais aliados tem a base em cada bairro dos quadrantes-alvo do bloco 1
+
+# votos de deputado (2026) e vereador (2024) por bairro: um candidato por linha, e a legenda de cada partido
+# candidato anulado (total oficial 0) nao e valido (regra da analise de campanhas) e sai; a legenda (sequencial nulo) fica
+votos_cargo <- votos_bairro %>%
+    filter(cargo %in% c("deputado estadual", "deputado federal", "vereador")) %>%
+    select(ano, cargo, id_municipio, bairro, sigla_partido, sequencial, votos) %>%
+    left_join(
+        candidaturas %>%
+            select(ano, cargo, sequencial, id_pessoa, nome_urna, resultado, votos_total),
+        by = c("ano", "cargo", "sequencial")
+    ) %>%
+    filter(is.na(sequencial) | votos_total > 0) %>%
+    mutate(campo = campo_partido(sigla_partido)) %>%
+    group_by(ano, cargo, id_municipio, bairro) %>%
+    mutate(validos = sum(votos)) %>%                                # nominais + legenda do cargo no bairro
+    ungroup()
+
+# validos do territorio (estado para deputado, municipio para vereador): base do QE e da fatia da pessoa no territorio
+territorio <- votos_cargo %>%
+    mutate(id_municipio = if_else(cargo == "vereador", id_municipio, NA_character_)) %>%
+    group_by(ano, cargo, id_municipio) %>%
+    summarise(validos_territorio = sum(votos), .groups = "drop") %>%
+    left_join(vagas, by = c("ano", "cargo", "id_municipio")) %>%
+    mutate(qe = validos_territorio / vagas)                         # v/QE como na analise de campanhas
+
+# quanto do voto de cada deputado vem de cada municipio: o deputado so entra nos municipios-base dele
+votos_municipio <- votos_cargo %>%
+    filter(!is.na(sequencial)) %>%
+    group_by(ano, cargo, id_municipio, sequencial) %>%
+    summarise(s_municipio = sum(votos) / first(votos_total), .groups = "drop")
+
+# quem entra: aliado formal, eleito ou a partir do piso de v/QE na propria candidatura,
+# e com uma fatia minima dos validos do cargo no bairro (f), para nao entrar quem nao existe ali
+# s = quanto do voto da pessoa vem do bairro; ql = quantas vezes ela e mais forte no bairro do que no territorio todo
+# deputado: so com o ql minimo e no municipio-base, ordenado por f; vereador: ordenado por s (dentro do bairro, mesma ordem do ql)
+forca_aliados <- votos_cargo %>%
+    filter(!is.na(sequencial), campo == "aliado") %>%
+    left_join(territorio %>% filter(cargo == "vereador"), by = c("ano", "cargo", "id_municipio")) %>%
+    left_join(territorio %>% filter(cargo != "vereador") %>% select(-id_municipio), by = c("ano", "cargo"), suffix = c("", "_estado")) %>%
+    left_join(votos_municipio, by = c("ano", "cargo", "id_municipio", "sequencial")) %>%
+    mutate(
+        v_qe = votos_total / coalesce(qe, qe_estado),
+        f = votos / validos,
+        s = votos / votos_total,
+        ql = f / (votos_total / coalesce(validos_territorio, validos_territorio_estado))
+    ) %>%
+    filter(
+        str_starts(resultado, "eleito") | v_qe >= if_else(cargo == "vereador", PISO_VQE_VEREADOR, PISO_VQE_DEPUTADO),
+        f >= FATIA_MINIMA_BAIRRO,
+        cargo == "vereador" | (ql >= QL_MINIMO & s_municipio >= FATIA_MINIMA_MUNICIPIO)
+    ) %>%
+    inner_join(
+        votos_estrategia %>%
+            filter(nivel == "bairro", quadrante %in% QUADRANTES_ALVO) %>%
+            select(id_municipio, nome_municipio, bairro, quadrante),
+        by = c("id_municipio", "bairro")
+    ) %>%
+    group_by(id_municipio, bairro, cargo) %>%
+    mutate(pos_bairro = rank(-if_else(cargo == "vereador", s, f), ties.method = "min"), top = pos_bairro <= TOP_BAIRRO) %>%
+    # a mesma pessoa pode estar em dois cargos (vereador em 2024 e deputado em 2026): conta por id_pessoa, nao por candidatura
+    # quem esta no top de varios bairros: o principal e onde esta a maior parte do voto dela, em qualquer dos cargos
+    group_by(id_pessoa) %>%
+    mutate(n_bairros_top = n_distinct(paste(id_municipio, bairro)[top]), bairro_principal = top & s == max(s[top], -Inf)) %>%
+    ungroup() %>%
+    left_join(prefeitos %>% select(id_municipio, campo_prefeito), by = "id_municipio")
+## FIM DO BLOCO 3 ##
+```
+```{r}
+
+# desenho dos bairros a partir dos locais de votacao de 2026, os mesmos da contagem: cada local fica com a area mais
+# proxima dele (Voronoi), recortada pelo municipio, e as areas sao unidas pelo texto de bairro do TSE
+
+# malha de municipios sem frestas, para o mapa: a base ja traz 906 frestas finas (ate ~60 m de largura) e 10 km2 de
+# sobreposicao entre vizinhos, e o st_simplify poligono a poligono abria mais. Cada trecho de divisa e simplificado uma
+# vez so, as faces sao refeitas a partir das divisas e cada face vai para um municipio so
+malha_sem_frestas <- function(malha, tolerancia, largura_maxima_fresta = 100) {
+    faces <- malha %>%
+        st_geometry() %>%
+        st_boundary() %>%
+        st_union() %>%                                       # divisas, cortadas onde se encontram
+        st_line_merge() %>%                                  # um trecho por divisa, de encontro a encontro
+        st_cast("LINESTRING") %>%
+        st_simplify(dTolerance = tolerancia, preserveTopology = TRUE) %>%   # cada trecho uma vez so; pontas no lugar, ilhas ficam
+        st_union() %>%                                       # religa onde dois trechos simplificados se cruzarem
+        st_polygonize() %>%
+        st_collection_extract("POLYGON") %>%
+        st_sf(face = seq_along(.), geometria = .) %>%
+        mutate(
+            area_face = as.numeric(st_area(geometria)),
+            largura = 2 * area_face / as.numeric(st_length(st_cast(geometria, "MULTILINESTRING")))   # largura media
+        )
+
+    # face coberta em mais da metade por um municipio fica com ele (sobreposicao da base: o que cobre mais; empate pelo codigo)
+    dono <- st_intersection(faces %>% select(face, area_face), malha) %>%
+        mutate(area = as.numeric(st_area(geometria))) %>%
+        st_drop_geometry() %>%
+        filter(area > 0.5 * area_face) %>%
+        arrange(face, desc(area), id_municipio) %>%
+        distinct(face, .keep_all = TRUE) %>%
+        select(face, id_municipio)
+    faces <- faces %>%
+        left_join(dono, by = "face")
+
+    # fresta (face fora de todo municipio, fina): vai para o vizinho com quem divide a maior divisa
+    repeat {
+        frestas <- faces %>%
+            filter(is.na(id_municipio), largura < largura_maxima_fresta)
+        if (nrow(frestas) == 0) break
+        vizinhos <- faces %>%
+            filter(!is.na(id_municipio)) %>%
+            group_by(id_municipio) %>%
+            summarise(.groups = "drop")
+        divisa <- st_intersection(st_boundary(frestas %>% select(face)), st_boundary(vizinhos)) %>%
+            mutate(comprimento = as.numeric(st_length(geometria))) %>%
+            st_drop_geometry() %>%
+            filter(comprimento > 0) %>%
+            arrange(face, desc(comprimento), id_municipio) %>%
+            distinct(face, .keep_all = TRUE)
+        if (nrow(divisa) == 0) break
+        faces$id_municipio[match(divisa$face, faces$face)] <- divisa$id_municipio
+    }
+
+    faces %>%
+        filter(!is.na(id_municipio)) %>%                     # sobra so agua larga entre municipios, se houver
+        group_by(id_municipio) %>%
+        summarise(.groups = "drop") %>%
+        st_make_valid()
+}
+
 municipios <- DBI::dbGetQuery(con, "SELECT id_municipio, geometria FROM br_geobr_mapas.municipio") %>%
     st_as_sf(wkt = "geometria", crs = 4326) %>%
     st_make_valid() %>%
-    st_transform(31983)   # metros (SIRGAS 2000 / UTM 23S), o Voronoi precisa de distancia plana
+    st_transform(31983) %>%   # metros (SIRGAS 2000 / UTM 23S), o Voronoi precisa de distancia plana
+    malha_sem_frestas(30)     # contorno mais leve para o html, antes do Voronoi: os bairros herdam as divisas ja simplificadas
 
+# 2026 nao tem coordenada no TSE. O mesmo local de 2024 (municipio + zona + numero, com nome ou endereco igual, sem acento,
+# pontuacao e espaco: o TSE reaproveita numeros de local) fica com a coordenada de 2024; o resto vai pelo geocodebr
 locais <- DBI::dbGetQuery(
     con,
-    "
-    SELECT  id_municipio,
-            zona,
-            numero,
-            ANY_VALUE(STRIP_ACCENTS(UPPER(TRIM(bairro)))) bairro,
-            ANY_VALUE(latitude) latitude,
-            ANY_VALUE(longitude) longitude,
-            SUM(eleitores_secao) eleitores
-    FROM br_tse_eleicoes.perfil_eleitorado_local_votacao
-    WHERE ano = 2024
-    AND turno = 1
-    AND latitude IS NOT NULL
-    GROUP BY 1, 2, 3
-    "
-) %>%
+    glue::glue(
+        "
+        WITH l AS (
+            SELECT  ano,
+                    id_municipio,
+                    zona,
+                    numero,
+                    ANY_VALUE(bairro) bairro,
+                    ANY_VALUE(endereco) endereco,
+                    ANY_VALUE(cep) cep,
+                    ANY_VALUE(REGEXP_REPLACE(STRIP_ACCENTS(UPPER(nome)), '[^A-Z0-9]', '', 'g')) nome_local,
+                    ANY_VALUE(REGEXP_REPLACE(STRIP_ACCENTS(UPPER(endereco)), '[^A-Z0-9]', '', 'g')) endereco_local,
+                    ANY_VALUE(latitude) latitude,
+                    ANY_VALUE(longitude) longitude,
+                    SUM(eleitores_secao) eleitores
+            FROM ({sql_secao_bairro})
+            WHERE ano IN (2024, 2026)
+            AND turno = 1
+            GROUP BY 1, 2, 3, 4
+        )
+
+        SELECT  l.id_municipio,
+                l.zona,
+                l.numero,
+                l.bairro,
+                l.endereco,
+                l.cep,
+                l2024.latitude,
+                l2024.longitude,
+                l.eleitores
+        FROM l
+        LEFT JOIN l l2024
+            ON l2024.ano = 2024
+            AND (l2024.id_municipio, l2024.zona, l2024.numero) = (l.id_municipio, l.zona, l.numero)
+            AND (l2024.nome_local = l.nome_local OR l2024.endereco_local = l.endereco_local)
+            AND l2024.latitude IS NOT NULL
+        WHERE l.ano = 2026
+        "
+    )
+)
+
+# rua e numero do endereco do TSE, separados para o geocodebr ("RUA X, 295 - BAIRRO" -> "RUA X" e "295"; S/N fica sem numero)
+separar_endereco <- function(endereco) {
+    e <- str_squish(toupper(endereco))
+    e <- str_replace(e, "\\s+-\\s+.*$", "")                         # depois de " - ": bairro, cidade, complemento
+    e <- str_replace_all(e, "(?<=\\d)\\.(?=\\d{3}\\b)", "")          # 22.155 -> 22155
+    sem_numero <- str_detect(e, "\\bS/?N[º°O]?\\b|\\bSEM N[UÚ]MERO\\b")
+    com_virgula <- str_match(e, "^(.*?),\\s*(?:N[º°O]?\\.?\\s*)?(\\d{1,5})\\b")
+    sem_virgula <- str_match(e, "^(.*\\D)\\s(?:N[º°O]?\\.?\\s*)?(\\d{1,5})\\b(?!.*\\d)")
+    rua <- coalesce(com_virgula[, 2], sem_virgula[, 2], e) %>%
+        str_replace("[,\\s]*\\bS/?N[º°O]?\\b.*$", "") %>%
+        str_replace("[,\\s]+$", "")
+    tibble(logradouro = rua, numero_rua = if_else(sem_numero, NA_character_, coalesce(com_virgula[, 3], sem_virgula[, 3])))
+}
+
+# local sem par em 2024: geocodebr (enderecos do CNEFE), em qualquer precisao, para nenhum bairro ficar sem desenho.
+# Contra a coordenada do TSE em 2024, o erro mediano e de ~10 m achando o numero, ~200 m pelo logradouro, ~500 m pelo CEP,
+# ~600 m pela localidade e ~10 km pelo municipio; o ponto so define o desenho, nao os numeros
+geocodebr::definir_pasta_cache("~/.cache/geocodebr")
+sem_par_2024 <- filter(locais, is.na(latitude))
+geocodificados <- sem_par_2024 %>%
+    select(-latitude, -longitude) %>%
+    bind_cols(separar_endereco(sem_par_2024$endereco)) %>%
+    mutate(estado = "RJ", cep = if_else(cep %in% c("11111111", "11111010"), NA_character_, cep)) %>%   # CEP de preenchimento do TSE
+    geocodebr::geocode(
+        campos_endereco = geocodebr::definir_campos(estado = "estado", municipio = "id_municipio", logradouro = "logradouro",
+                                                    numero = "numero_rua", cep = "cep", localidade = "bairro"),
+        verboso = FALSE
+    ) %>%
+    transmute(id_municipio, zona, numero, latitude = lat, longitude = lon)
+
+locais <- locais %>%
+    rows_update(geocodificados, by = c("id_municipio", "zona", "numero")) %>%
+    filter(!is.na(latitude)) %>%
+    select(id_municipio, zona, numero, bairro, latitude, longitude, eleitores) %>%
     arrange(desc(eleitores)) %>%
     distinct(id_municipio, latitude, longitude, .keep_all = TRUE) %>%   # locais no mesmo ponto: fica o bairro com mais eleitores
     st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
@@ -296,34 +799,68 @@ bairros_voronoi <- municipios %>%
 
 ```{r}
 ## mapa da estrategia: municipios na vista do estado, bairros ao aproximar
-library(leaflet)
-
 pct <- scales::label_percent(accuracy = 0.1, decimal.mark = ",")
 num <- scales::label_number(big.mark = ".", decimal.mark = ",")
 pp <- scales::label_number(accuracy = 0.1, scale = 100, decimal.mark = ",", style_positive = "plus", suffix = " p.p.")
+sinal <- scales::label_number(style_positive = "plus")
 
 rotulos_quadrante <- c("1.prioridade" = "1º Prioridade", "2.investir" = "2º Investir", "3.manter" = "3º Manter", "4.baixa prioridade" = "4º Baixa prioridade")
 cores_quadrante <- c("#08306b", "#2171b5", "#6baed6", "#bdbdbd")    # azul forte para fraco: a ordem de prioridade
 pal_quadrante <- colorFactor(cores_quadrante, levels = rotulos_quadrante, na.color = "#f0f0f0")
 
+desenhar_seta <- function(tendencia) {
+    case_when(
+        tendencia == "em alta" ~ "<span style='color:#1a9641'>▲</span>",
+        tendencia == "em baixa" ~ "<span style='color:#d7191c'>▼</span>",
+        TRUE ~ ""
+    )
+}
+
+# primeira linha de todo rotulo: bairro · municipio, ou so o municipio
+titulo_area <- function(bairro, nome_municipio) {
+    paste0("<b>", if_else(is.na(bairro), "", paste0(bairro, " · ")), nome_municipio, "</b><br>")
+}
+
+# camada de areas coloridas, com o rotulo (coluna em html) ao passar o mouse
+add_areas <- function(mapa, data, group, cor, rotulo, weight, popup = NULL) {
+    addPolygons(mapa, data = data, group = group, fillColor = cor, fillOpacity = 0.9, color = "white", weight = weight,
+                label = lapply(data[[rotulo]], htmltools::HTML), popup = popup, highlightOptions = highlightOptions(weight = 3, color = "black"))
+}
+
 estrategia_mapa <- votos_estrategia %>%
     mutate(
         prioridade = factor(rotulos_quadrante[quadrante], levels = rotulos_quadrante),
-        seta = case_when(
-            tendencia == "em alta" ~ "<span style='color:#1a9641'>▲</span>",
-            tendencia == "em baixa" ~ "<span style='color:#d7191c'>▼</span>",
-            TRUE ~ ""
-        ),
+        seta = desenhar_seta(tendencia),
+        seta_lula = desenhar_seta(tendencia_lula),
         rotulo = glue::glue(
-            "<b>{if_else(is.na(bairro), '', paste0(bairro, ' · '))}{nome_municipio}</b><br>",
-            "<b>{prioridade}</b> · tendência: {coalesce(tendencia, 'sem 2018')} {seta}<br><br>",
+            "{titulo_area(bairro, nome_municipio)}",
+            "<b>{prioridade}</b><br>",
+            "Tendência Paes: {coalesce(tendencia, 'sem 2018')} {seta}<br>",
+            "Tendência Lula: {coalesce(tendencia_lula, 'sem 2022')} {seta_lula}<br><br>",
             "Paes {num(votos_paes)} x Ruas {num(votos_oposicao)}<br>",
             "Margem: {pp(margem)} ({num(margem_bruta)} votos)<br>",
             "Variação da margem desde 2018: {coalesce(pp(delta_margem), 'sem 2018')}<br>",
             "Paes precisa de {pct(dificuldade)} dos votos abertos para empatar<br>",
-            "Comparecimento: {pct(pct_comparecimento)}<br>",
-            "Reserva (abstenção + brancos + nulos): {num(reserva)}<br>",
-            "Reserva com transferíveis (+ votos em outros candidatos): {num(reserva_c_transferiveis)}"
+            "Margem do Lula sobre o 22: {pp(margem_lula)} (variação desde 2022: {coalesce(pp(delta_margem_lula), 'sem 2022')})<br>",
+            "Comparecimento: {pct(pct_comparecimento)} (variação desde 2018: {coalesce(pp(-delta_pct_abstencao), 'sem 2018')})<br>",
+            "Votos em jogo (brancos + nulos + outros candidatos): {num(reserva_c_transferiveis)}<br>",
+            "Abstenção (fora dos votos em jogo): {num(votos_abstencoes_total)}<br>",
+            "<i>clique para ver o perfil do eleitorado</i>"
+        ) %>%
+            as.character(),
+        # perfil do eleitorado abre no clique (popup), para nao alongar o rotulo de passar o mouse
+        # (coluna popup, e nao perfil: perfil ja e o reduto / virou pro Paes do votos_margem)
+        popup = glue::glue(
+            "{titulo_area(bairro, nome_municipio)}",
+            "<b>Perfil do eleitorado (2026)</b><br>",
+            "Eleitores: {num(eleitores_perfil)} · Mulheres: {pct(pct_mulheres)}<br><br>",
+            "16 a 24 anos: {pct(pct_16_24)}<br>",
+            "25 a 34 anos: {pct(pct_25_34)}<br>",
+            "35 a 44 anos: {pct(pct_35_44)}<br>",
+            "45 a 59 anos: {pct(pct_45_59)}<br>",
+            "60 anos ou mais: {pct(pct_60_mais)} (70 ou mais, voto facultativo: {pct(pct_70_mais)})<br><br>",
+            "Superior (completo ou incompleto): {pct(pct_superior)}<br>",
+            "Até fundamental incompleto: {pct(pct_ate_fund_incompleto)}"
         ) %>%
             as.character()
     )
@@ -333,11 +870,12 @@ areas <- bind_rows(
     municipios %>% st_transform(4326) %>% mutate(nivel = "municipio"),
     bairros_voronoi %>% mutate(nivel = "bairro")
 ) %>%
-    st_transform(31983) %>%
-    st_simplify(dTolerance = 30, preserveTopology = TRUE) %>%    # contorno mais leve para o html
     st_transform(4326) %>%
     left_join(estrategia_mapa, by = c("nivel", "id_municipio", "bairro")) %>%
-    mutate(rotulo = coalesce(rotulo, paste0("<b>", bairro, "</b><br>sem voto em 2026")))
+    mutate(
+        rotulo = coalesce(rotulo, paste0("<b>", bairro, "</b><br>sem voto em 2026")),
+        popup = coalesce(popup, rotulo)
+    )
 
 setas <- areas %>%
     filter(seta != "") %>%
@@ -350,10 +888,8 @@ estilo_seta <- labelOptions(noHide = TRUE, direction = "center", textOnly = TRUE
 
 mapa_estrategia <- leaflet() %>%
     addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
-    addPolygons(data = filter(areas, nivel == "municipio"), group = "municipio", fillColor = ~pal_quadrante(prioridade),
-                fillOpacity = 0.9, color = "white", weight = 1, label = ~lapply(rotulo, htmltools::HTML), highlightOptions = highlightOptions(weight = 3, color = "black")) %>%
-    addPolygons(data = filter(areas, nivel == "bairro"), group = "bairro", fillColor = ~pal_quadrante(prioridade),
-                fillOpacity = 0.9, color = "white", weight = 0.5, label = ~lapply(rotulo, htmltools::HTML), highlightOptions = highlightOptions(weight = 3, color = "black")) %>%
+    add_areas(filter(areas, nivel == "municipio"), "municipio", ~pal_quadrante(prioridade), "rotulo", weight = 1, popup = ~popup) %>%
+    add_areas(filter(areas, nivel == "bairro"), "bairro", ~pal_quadrante(prioridade), "rotulo", weight = 0.5, popup = ~popup) %>%
     addLabelOnlyMarkers(data = filter(setas, nivel == "municipio"), group = "municipio", label = ~lapply(seta, htmltools::HTML), labelOptions = estilo_seta) %>%
     addLabelOnlyMarkers(data = filter(setas, nivel == "bairro"), group = "setas_bairro", label = ~lapply(seta, htmltools::HTML), labelOptions = estilo_seta) %>%
     groupOptions("municipio", zoomLevels = 1:9) %>%              # vista do estado: municipios
@@ -365,3 +901,107 @@ mapa_estrategia <- leaflet() %>%
 mapa_estrategia
 htmlwidgets::saveWidget(mapa_estrategia, "mapa_estrategia.html", selfcontained = TRUE)
 
+## mapa das acoes de rua (bloco 3): como o da estrategia, municipios na vista do estado e bairros ao aproximar
+cargo_rotulo <- c("deputado estadual" = "dep. est.", "deputado federal" = "dep. fed.", "vereador" = "vereador")
+faixas_aliados <- c("7 ou mais", "4 a 6", "1 a 3", "nenhum")
+pal_aliados <- colorFactor(cores_quadrante, levels = faixas_aliados)
+faixa_aliados <- function(n) factor(case_when(n >= 7 ~ "7 ou mais", n >= 4 ~ "4 a 6", n >= 1 ~ "1 a 3", TRUE ~ "nenhum"), levels = faixas_aliados)
+quadrantes_alvo_texto <- str_flatten(str_sub(QUADRANTES_ALVO, 1, 1), ", ", last = " e ")   # "1 e 2"
+
+# bairro: uma linha por pessoa (quem esta em dois cargos aparece uma vez, com as duas posicoes); ★ = o bairro principal dela
+quem_bairro <- forca_aliados %>%
+    filter(top) %>%
+    arrange(cargo, pos_bairro) %>%
+    group_by(id_municipio, bairro, id_pessoa) %>%
+    summarise(
+        linha = paste0(first(nome_urna), " (", paste0(cargo_rotulo[cargo], " ", pos_bairro, "º", collapse = " · "), ")", if_else(any(bairro_principal), " ★", "")),
+        melhor_posicao = min(pos_bairro),
+        .groups = "drop"
+    ) %>%
+    arrange(melhor_posicao) %>%
+    group_by(id_municipio, bairro) %>%
+    summarise(n_aliados = n(), quem_mandar = paste(linha, collapse = "<br>"), .groups = "drop")
+
+# municipio: resume os bairros dele, com quem esta no top de algum bairro e em quantos (os 10 com mais bairros)
+quem_municipio <- forca_aliados %>%
+    filter(top) %>%
+    arrange(cargo) %>%                                           # nome de urna de quem esta em dois cargos: o do primeiro, como no bairro
+    group_by(id_municipio, id_pessoa) %>%
+    summarise(
+        nome = first(nome_urna),
+        cargos = paste(cargo_rotulo[sort(unique(cargo))], collapse = " · "),
+        n_bairros = n_distinct(bairro),
+        .groups = "drop"
+    ) %>%
+    arrange(desc(n_bairros)) %>%
+    group_by(id_municipio) %>%
+    summarise(
+        n_aliados = n(),
+        quem_mandar = paste(head(paste0(nome, " (", cargos, ") · ", n_bairros, if_else(n_bairros == 1, " bairro", " bairros")), 10), collapse = "<br>") %>%
+            paste0(if_else(n() > 10, paste0("<br>+ ", n() - 10, if_else(n() == 11, " outro", " outros")), "")),
+        .groups = "drop"
+    )
+
+bairros_alvo <- votos_estrategia %>%
+    filter(nivel == "bairro", quadrante %in% QUADRANTES_ALVO) %>%
+    count(id_municipio, name = "n_bairros_alvo")
+
+# prefeito e camara: o campo de hoje e se virou ou nao virou aliado desde 2020 (bloco 2)
+prefeito_mapa <- municipios_campo %>%
+    transmute(
+        id_municipio,
+        prefeito = glue::glue("{coalesce(prefeito_atual, prefeito_2024, 'sem informação')} ({coalesce(recode(campo_prefeito, oposicao = 'oposição'), 'sem informação')} · {mudanca_prefeito})"),
+        camara = glue::glue("{cadeiras_aliado} de {cadeiras} cadeiras aliadas ({sinal(delta_cadeiras_aliado)} desde 2020) · {mudanca_camara}")
+    )
+
+# o que vale para os dois niveis: prioridade, votos em jogo, abstencao, tendencias e prefeito
+cabecalho <- function(df) {
+    glue::glue_data(
+        df,
+        "{titulo_area(bairro, nome_municipio)}",
+        "<b>{prioridade}</b> · votos em jogo: {num(votos_abertos)}<br>",
+        "Abstenção: {num(votos_abstencoes_total)}<br>",
+        "Tendência Paes: {coalesce(tendencia, 'sem 2018')} {seta} · Lula: {coalesce(tendencia_lula, 'sem 2022')} {seta_lula}<br>",
+        "Prefeito: {prefeito}<br>",
+        "Câmara: {camara}<br><br>"
+    )
+}
+
+acoes_bairro <- areas %>%
+    filter(nivel == "bairro", quadrante %in% QUADRANTES_ALVO) %>%
+    left_join(quem_bairro, by = c("id_municipio", "bairro")) %>%
+    left_join(prefeito_mapa, by = "id_municipio") %>%
+    mutate(
+        faixa = faixa_aliados(coalesce(n_aliados, 0L)),
+        rotulo_rua = paste0(cabecalho(.), "<b>Quem mandar</b><br>", coalesce(quem_mandar, "nenhum aliado com base no bairro"))
+    )
+
+acoes_municipio <- areas %>%
+    filter(nivel == "municipio") %>%
+    left_join(quem_municipio, by = "id_municipio") %>%
+    left_join(bairros_alvo, by = "id_municipio") %>%
+    left_join(prefeito_mapa, by = "id_municipio") %>%
+    mutate(
+        faixa = faixa_aliados(coalesce(n_aliados, 0L)),
+        rotulo_rua = paste0(
+            cabecalho(.),
+            "Bairros para ação de rua (quadrantes ", quadrantes_alvo_texto, "): ", coalesce(n_bairros_alvo, 0L), "<br><br>",
+            "<b>Quem tem base aqui</b> (em quantos bairros está no top ", TOP_BAIRRO, ")<br>", coalesce(quem_mandar, "nenhum aliado com base no município"), "<br>",
+            "<i>aproxime para ver quem mandar em cada bairro</i>"
+        )
+    )
+
+mapa_acoes_rua <- leaflet() %>%
+    addProviderTiles(providers$Esri.WorldGrayCanvas) %>%
+    add_areas(acoes_municipio, "municipio", ~pal_aliados(faixa), "rotulo_rua", weight = 1) %>%
+    addPolygons(data = filter(areas, nivel == "municipio"), group = "contorno", fill = FALSE, color = "#969696", weight = 0.7) %>%
+    add_areas(acoes_bairro, "bairro", ~pal_aliados(faixa), "rotulo_rua", weight = 0.5) %>%
+    groupOptions("municipio", zoomLevels = 1:9) %>%              # vista do estado: municipios
+    groupOptions("contorno", zoomLevels = 10:18) %>%             # aproximando: contorno dos municipios em volta dos bairros-alvo
+    groupOptions("bairro", zoomLevels = 10:18) %>%               # aproximando: so os bairros-alvo
+    addLegend(colors = cores_quadrante, labels = faixas_aliados, title = "Aliados com base no lugar", opacity = 0.9) %>%
+    addControl("★ = bairro principal da pessoa", position = "bottomleft")
+
+mapa_acoes_rua
+htmlwidgets::saveWidget(mapa_acoes_rua, "mapa_acoes_rua.html", selfcontained = TRUE)
+```
