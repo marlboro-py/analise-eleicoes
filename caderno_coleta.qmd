@@ -11,7 +11,7 @@ execute:
 
 # OBJETIVO
 
-Montar um banco relacional DuckDB com as eleições de 2018 a 2026 no RJ (mais as candidaturas de 2014 e 2016, para o histórico de cada candidato) e as bases de contexto, tudo extraído do BigQuery. As tabelas mantêm o nome de conjunto, tabela e coluna da origem (`br_tse_eleicoes.resultados_candidato_secao`, por exemplo), para que consultas escritas para a Base dos Dados funcionem aqui sem mudança.
+Montar um banco relacional DuckDB com as eleições de 2000 a 2026 no RJ (2000 a 2016 como histórico de cada candidato) e as bases de contexto, tudo extraído do BigQuery. As tabelas mantêm o nome de conjunto, tabela e coluna da origem (`br_tse_eleicoes.resultados_candidato_secao`, por exemplo), para que consultas escritas para a Base dos Dados funcionem aqui sem mudança.
 
 Etapas: cada consulta vira um Parquet em `dfs/brutos/` (dado bruto, nunca sobrescrito) e os Parquets viram as tabelas do `.duckdb`.
 
@@ -35,7 +35,12 @@ from google.cloud import bigquery
 SIGLA_UF = "RJ"
 MUNICIPIOS_TSE = []                       # codigos TSE; lista vazia = estado inteiro
 ANOS_ELEICAO = [2018, 2020, 2022, 2024, 2026]
-ANOS_HISTORICO = [2014, 2016]             # so candidatos e resultados_candidato: conta candidaturas e mandatos antes de 2018
+ANOS_HISTORICO = list(range(2000, 2018, 2))   # 2000 a 2016: candidaturas, mandatos e voto por secao de cada candidato antes de 2018
+ANOS_TODOS = ANOS_HISTORICO + ANOS_ELEICAO
+# a Base dos Dados nao cobre todos os anos em toda tabela (RJ, conferido em 2026-10-09): despesas so de 2002,
+# perfil do eleitorado so de 2008 e local de votacao (a chave secao -> bairro) so de 2010
+def anos_desde(inicio: int) -> list[int]:
+    return [ano for ano in ANOS_TODOS if ano >= inicio]
 ANOS_RAIS = list(range(2017, 2026))
 DATA_INICIO_1746 = "2017-10-01"
 COLUNAS_1746 = ["id_chamado", "data_inicio", "id_bairro", "categoria", "tipo", "subtipo", "status", "latitude", "longitude"]
@@ -71,17 +76,17 @@ ibge_where = (
 
 EXTRACTIONS = [
     # eleicoes
-    {"table": f"{TSE}.candidatos", "anos": ANOS_HISTORICO + ANOS_ELEICAO},      # nominatas e perfil dos candidatos
-    {"table": f"{TSE}.partidos", "anos": ANOS_ELEICAO},                         # coligacoes e federacoes (quem e aliado de quem)
-    {"table": f"{TSE}.vagas", "anos": ANOS_ELEICAO},                            # cadeiras em disputa por cargo
-    {"table": f"{TSE}.resultados_candidato", "anos": ANOS_HISTORICO + ANOS_ELEICAO},  # situacao final e total de cada candidato
-    {"table": f"{TSE}.resultados_candidato_municipio", "anos": ANOS_ELEICAO},   # votos por candidato em cada municipio do estado
-    {"table": f"{TSE}.resultados_candidato_secao", "anos": ANOS_ELEICAO},       # voto nominal por secao
-    {"table": f"{TSE}.resultados_partido_secao", "anos": ANOS_ELEICAO},         # voto de legenda por secao
-    {"table": f"{TSE}.detalhes_votacao_secao", "anos": ANOS_ELEICAO},           # aptos, comparecimento, brancos e nulos por secao
-    {"table": f"{TSE}.perfil_eleitorado_secao", "anos": ANOS_ELEICAO},          # instrucao, idade e genero do eleitorado por secao
-    {"table": f"{TSE}.perfil_eleitorado_local_votacao", "anos": ANOS_ELEICAO},  # secao -> local de votacao, endereco e coordenadas
-    {"table": f"{TSE}.despesas_candidato", "anos": ANOS_ELEICAO},               # gastos declarados por candidato (custo do voto); 2026 e a prestacao parcial ate sair a final
+    {"table": f"{TSE}.candidatos", "anos": ANOS_TODOS},                         # nominatas e perfil dos candidatos
+    {"table": f"{TSE}.partidos", "anos": ANOS_TODOS},                           # coligacoes e federacoes (quem e aliado de quem)
+    {"table": f"{TSE}.vagas", "anos": ANOS_TODOS},                              # cadeiras em disputa por cargo
+    {"table": f"{TSE}.resultados_candidato", "anos": ANOS_TODOS},               # situacao final e total de cada candidato
+    {"table": f"{TSE}.resultados_candidato_municipio", "anos": ANOS_TODOS},     # votos por candidato em cada municipio do estado
+    {"table": f"{TSE}.resultados_candidato_secao", "anos": ANOS_TODOS},         # voto nominal por secao
+    {"table": f"{TSE}.resultados_partido_secao", "anos": ANOS_TODOS},           # voto de legenda por secao
+    {"table": f"{TSE}.detalhes_votacao_secao", "anos": ANOS_TODOS},             # aptos, comparecimento, brancos e nulos por secao
+    {"table": f"{TSE}.perfil_eleitorado_secao", "anos": anos_desde(2008)},      # instrucao, idade e genero do eleitorado por secao
+    {"table": f"{TSE}.perfil_eleitorado_local_votacao", "anos": anos_desde(2010)},  # secao -> local de votacao, endereco e coordenadas
+    {"table": f"{TSE}.despesas_candidato", "anos": anos_desde(2002)},           # gastos declarados por candidato (custo do voto); 2026 e a prestacao parcial ate sair a final
     # chave entre as bases
     {"table": "basedosdados.br_bd_diretorios_brasil.municipio"},                # codigo IBGE <-> codigo TSE
     # contexto
